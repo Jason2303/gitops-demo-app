@@ -1,0 +1,155 @@
+name: CI
+
+# Test on every push and PR. Build/push/deploy only from main.
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: ["README.md", "docs/**"]
+  pull_request:
+    branches: [main]
+
+# Default to read-only; jobs widen only what they need.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: gitops-demo-app
+
+jobs:
+  # ---------------------------------------------------------------- 1. TEST
+  test:
+    name: Lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: flake8 app tests --max-line-length=100
+
+      - name: Unit tests
+        run: pytest -v
+
+  # ------------------------------------------------- 2. BUILD + SCAN + PUSH
+  build-and-push:
+    name: Build & push image
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # push to GHCR with the built-in token, no PAT needed
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name and immutable tag
+        id: vars
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"            # GHCR requires lowercase
+          echo "image=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::7}"                  >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image (load locally for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}
+          build-args: APP_VERSION=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for HIGH/CRITICAL CVEs
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}
+            ${{ steps.vars.outputs.image }}:latest
+          build-args: APP_VERSION=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  # ------------------------------------------- 3. UPDATE GITOPS CONFIG REPO
+  update-config-repo:
+    name: Bump staging image tag in config repo
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout config repo (write-scoped deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.CONFIG_REPO }}           # e.g. my-user/gitops-demo-config
+          ssh-key: ${{ secrets.CONFIG_REPO_DEPLOY_KEY }}
+          ref: main
+
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: "5.4.3"
+
+      - name: Set new image tag in staging overlay
+        working-directory: apps/demo-app/overlays/staging
+        run: |
+          kustomize edit set image \
+            demo-app=${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.tag }}
+          git diff
+
+      - name: Commit and push (with retry on concurrent updates)
+        env:
+          TAG: ${{ needs.build-and-push.outputs.tag }}
+        run: |
+          git config user.name  "gitops-bot"
+          git config user.email "gitops-bot@users.noreply.github.com"
+          git add apps/demo-app/overlays/staging/kustomization.yaml
+          if git diff --cached --quiet; then
+            echo "Tag already set, nothing to commit"; exit 0
+          fi
+          git commit -m "deploy(staging): demo-app ${TAG}" \
+                     -m "Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          for i in 1 2 3; do
+            git push origin main && exit 0
+            echo "Push rejected, rebasing (attempt $i)"; git pull --rebase origin main
+          done
+          exit 1
+
+      - name: Job summary
+        run: |
+          echo "### Deployed to staging via GitOps" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: \`${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "ArgoCD will auto-sync **demo-app-staging**. Promote to production with the *Promote to production* workflow in the config repo." >> "$GITHUB_STEP_SUMMARY"
